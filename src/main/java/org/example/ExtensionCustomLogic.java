@@ -48,7 +48,7 @@ public class ExtensionCustomLogic extends CallbackAdapter {
             + "/delete 2995104339\n";
 
     public static void main(String[] args) throws Exception {
-        String TOKEN = "77f063eb6f75fea4d48bff454ece5387997c611c77f063eb6f75fea4d48bff454ece5387997c611c";
+        String TOKEN = "90091783792236740:0:go0gSHnPNT9qQIBlk47lQmhty91hax";
         NandboxClient client = NandboxClient.get();
         client.connect(TOKEN, new ExtensionCustomLogic());
     }
