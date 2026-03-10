@@ -28,7 +28,7 @@ public class ExtensionCustomLogic extends CallbackAdapter {
     private Nandbox.Api api;
 
     private static final String TODOIST_API_BASE = "https://api.todoist.com";
-    private static final String TODOIST_TASKS_PATH = "/rest/v1/tasks";
+    private static final String TODOIST_TASKS_PATH = "/api/v1/tasks";
     private static final int HTTP_TIMEOUT_MS = 15000;
 
     private static final String HELP_TEXT = "Available commands:\n"
