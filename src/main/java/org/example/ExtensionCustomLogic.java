@@ -625,7 +625,7 @@ public class ExtensionCustomLogic extends CallbackAdapter {
     }
 
     private static String getTodoistToken() throws Exception {
-        String env = System.getenv("TODOIST_TOKEN");
+        String env = "77f063eb6f75fea4d48bff454ece5387997c611c";
         if (env != null && env.trim().length() > 0) {
             return env.trim();
         }
