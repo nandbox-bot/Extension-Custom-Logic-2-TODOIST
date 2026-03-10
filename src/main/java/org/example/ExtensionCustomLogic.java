@@ -21,23 +21,31 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.net.URLEncoder;
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 public class ExtensionCustomLogic extends CallbackAdapter {
     private Nandbox.Api api;
 
     private static final String TODOIST_API_BASE = "https://api.todoist.com";
-    private static final String TODOIST_REST_V2_BASE = "https://api.todoist.com/rest/v2";
-
+    private static final String TODOIST_TASKS_PATH = "/rest/v1/tasks";
     private static final int HTTP_TIMEOUT_MS = 15000;
 
-    private String todoistToken;
+    private static final String HELP_TEXT = "Available commands:\n"
+            + "/help - show this help\n"
+            + "/tasks - list open tasks\n"
+            + "/add <content> [| projectId=<id>] [| due=<string>] [| priority=1-4] - create a task\n"
+            + "/done <taskId> - close a task\n"
+            + "/delete <taskId> - delete a task\n"
+            + "/usage - show examples\n";
 
-    private final Map/*<String, String>*/ userTokens = new HashMap();
+    private static final String USAGE_TEXT = "Examples:\n"
+            + "/tasks\n"
+            + "/add Buy milk\n"
+            + "/add Submit report | due=tomorrow 17:00 | priority=4\n"
+            + "/add Fix bug #123 | projectId=2203306141\n"
+            + "/done 2995104339\n"
+            + "/delete 2995104339\n";
 
     public static void main(String[] args) throws Exception {
         String TOKEN = "77f063eb6f75fea4d48bff454ece5387997c611c77f063eb6f75fea4d48bff454ece5387997c611c";
@@ -48,23 +56,16 @@ public class ExtensionCustomLogic extends CallbackAdapter {
     @Override
     public void onConnect(Nandbox.Api api) {
         this.api = api;
-        this.todoistToken = loadTodoistTokenFromConfig();
-        if (this.todoistToken == null || this.todoistToken.trim().length() == 0) {
-            this.todoistToken = System.getProperty("TODOIST_TOKEN");
-        }
-        if (this.todoistToken == null || this.todoistToken.trim().length() == 0) {
-            this.todoistToken = System.getenv("TODOIST_TOKEN");
-        }
     }
 
     @Override
     public void onReceive(IncomingMessage incomingMsg) {
-        if (incomingMsg == null || incomingMsg.getChat() == null || incomingMsg.getChat().getId() == null) {
+        if (incomingMsg == null || api == null) {
             return;
         }
 
-        String chatId = incomingMsg.getChat().getId();
-        String userId = incomingMsg.getFrom() != null ? incomingMsg.getFrom().getId() : null;
+        String chatId = safeChatId(incomingMsg);
+        String userId = safeUserId(incomingMsg);
         String appId = incomingMsg.getAppId();
         Integer chatSettings = incomingMsg.getChatSettings();
 
@@ -78,102 +79,85 @@ public class ExtensionCustomLogic extends CallbackAdapter {
         }
 
         try {
-            if (text.equalsIgnoreCase("/start") || text.equalsIgnoreCase("start")) {
-                send(chatId, helpText(), userId, appId, chatSettings);
+            if (isHelp(text)) {
+                sendText(chatId, HELP_TEXT, userId, appId, chatSettings);
                 return;
             }
 
-            if (text.equalsIgnoreCase("/help") || text.equalsIgnoreCase("help")) {
-                send(chatId, helpText(), userId, appId, chatSettings);
+            if (equalsCommand(text, "/usage")) {
+                sendText(chatId, USAGE_TEXT, userId, appId, chatSettings);
                 return;
             }
 
-            if (text.toLowerCase().startsWith("/token") || text.toLowerCase().startsWith("token")) {
-                String[] parts = splitFirstArg(text);
-                String arg = parts[1];
-                if (arg == null || arg.trim().length() == 0) {
-                    send(chatId, "Usage: /token <todoist_personal_token>\nThis sets a token for your user only.", userId, appId, chatSettings);
+            if (equalsCommand(text, "/tasks")) {
+                JSONArray tasks = todoistGetTasks();
+                String formatted = formatTasks(tasks);
+                sendText(chatId, formatted, userId, appId, chatSettings);
+                return;
+            }
+
+            if (startsWithCommand(text, "/add")) {
+                String args = extractArgs(text, "/add");
+                if (args.length() == 0) {
+                    sendText(chatId, "Usage: /add <content> [| projectId=<id>] [| due=<string>] [| priority=1-4]", userId, appId, chatSettings);
                     return;
                 }
-                if (userId == null) {
-                    send(chatId, "Could not determine user id for this chat.", userId, appId, chatSettings);
+                AddCommand add = parseAddCommand(args);
+                if (add == null || add.content == null || add.content.trim().length() == 0) {
+                    sendText(chatId, "Could not parse /add command. Use /usage for examples.", userId, appId, chatSettings);
                     return;
                 }
-                userTokens.put(userId, arg.trim());
-                send(chatId, "Token saved for your user. You can now use /tasks, /add, /done, /close.", userId, appId, chatSettings);
+                JSONObject created = todoistAddTask(add);
+                String reply = formatCreatedTask(created);
+                sendText(chatId, reply, userId, appId, chatSettings);
                 return;
             }
 
-            if (text.equalsIgnoreCase("/tasks") || text.equalsIgnoreCase("tasks")) {
-                String token = getEffectiveTodoistToken(userId);
-                if (!ensureToken(chatId, token, userId, appId, chatSettings)) return;
-
-                JSONArray tasks = todoistGetActiveTasks(token);
-                send(chatId, formatTasks(tasks), userId, appId, chatSettings);
-                return;
-            }
-
-            if (text.toLowerCase().startsWith("/add") || text.toLowerCase().startsWith("add")) {
-                String[] parts = splitFirstArg(text);
-                String content = parts[1];
-                if (content == null || content.trim().length() == 0) {
-                    send(chatId, "Usage: /add <task content>", userId, appId, chatSettings);
+            if (startsWithCommand(text, "/done")) {
+                String args = extractArgs(text, "/done");
+                if (args.length() == 0) {
+                    sendText(chatId, "Usage: /done <taskId>", userId, appId, chatSettings);
                     return;
                 }
-                String token = getEffectiveTodoistToken(userId);
-                if (!ensureToken(chatId, token, userId, appId, chatSettings)) return;
-
-                JSONObject created = todoistCreateTask(token, content.trim());
-                String id = created.getAsString("id");
-                String c = created.getAsString("content");
-                if (id == null) id = "";
-                if (c == null) c = "";
-                send(chatId, "Created task: " + c + "\nID: " + id, userId, appId, chatSettings);
+                String taskId = args.trim();
+                todoistCloseTask(taskId);
+                sendText(chatId, "Closed task " + taskId + ".", userId, appId, chatSettings);
                 return;
             }
 
-            if (text.toLowerCase().startsWith("/done") || text.toLowerCase().startsWith("done")) {
-                String[] parts = splitFirstArg(text);
-                String id = parts[1];
-                if (id == null || id.trim().length() == 0) {
-                    send(chatId, "Usage: /done <task_id>", userId, appId, chatSettings);
+            if (startsWithCommand(text, "/delete")) {
+                String args = extractArgs(text, "/delete");
+                if (args.length() == 0) {
+                    sendText(chatId, "Usage: /delete <taskId>", userId, appId, chatSettings);
                     return;
                 }
-                String token = getEffectiveTodoistToken(userId);
-                if (!ensureToken(chatId, token, userId, appId, chatSettings)) return;
-
-                todoistCloseTask(token, id.trim());
-                send(chatId, "Marked as completed: " + id.trim(), userId, appId, chatSettings);
+                String taskId = args.trim();
+                todoistDeleteTask(taskId);
+                sendText(chatId, "Deleted task " + taskId + ".", userId, appId, chatSettings);
                 return;
             }
 
-            if (text.toLowerCase().startsWith("/close") || text.toLowerCase().startsWith("close")) {
-                String[] parts = splitFirstArg(text);
-                String id = parts[1];
-                if (id == null || id.trim().length() == 0) {
-                    send(chatId, "Usage: /close <task_id>", userId, appId, chatSettings);
-                    return;
-                }
-                String token = getEffectiveTodoistToken(userId);
-                if (!ensureToken(chatId, token, userId, appId, chatSettings)) return;
-
-                todoistCloseTask(token, id.trim());
-                send(chatId, "Closed task: " + id.trim(), userId, appId, chatSettings);
+            if (text.startsWith("/")) {
+                sendText(chatId, "Unknown command. Type /help", userId, appId, chatSettings);
                 return;
             }
 
-            send(chatId, "Unknown command.\n\n" + helpText(), userId, appId, chatSettings);
-
-        } catch (Exception ex) {
-            String msg = "Error: " + safe(ex.getMessage());
-            send(chatId, msg, userId, appId, chatSettings);
+            sendText(chatId, "Type /help to see available commands.", userId, appId, chatSettings);
+        } catch (Exception e) {
+            String msg = e.getMessage();
+            if (msg == null || msg.length() == 0) {
+                msg = e.toString();
+            }
+            sendText(chatId, "Error: " + msg, userId, appId, chatSettings);
         }
     }
 
     @Override
     public void onReceive(JSONObject obj) {
-        if (obj == null) return;
-        if (looksLikeChatMessagePayload(obj)) {
+        if (obj == null) {
+            return;
+        }
+        if (looksLikeChatMessage(obj)) {
             return;
         }
     }
@@ -294,13 +278,11 @@ public class ExtensionCustomLogic extends CallbackAdapter {
     public void onMenuCallBack(MenuCallback menuCallback) {
     }
 
-    private void send(String chatId, String text, String toUserId, String appId, Integer chatSettings) {
-        if (this.api == null) return;
-        String reference = Utils.getUniqueId();
-        this.api.sendText(
+    private void sendText(String chatId, String text, String toUserId, String appId, Integer chatSettings) {
+        api.sendText(
                 chatId,
                 text,
-                reference,
+                Utils.getUniqueId(),
                 null,
                 toUserId,
                 Integer.valueOf(0),
@@ -313,172 +295,301 @@ public class ExtensionCustomLogic extends CallbackAdapter {
         );
     }
 
-    private boolean ensureToken(String chatId, String token, String userId, String appId, Integer chatSettings) {
-        if (token == null || token.trim().length() == 0) {
-            send(chatId, "Todoist token not configured.\nSet it using /token <personal_token> or provide TODOIST_TOKEN via env/system property/config.", userId, appId, chatSettings);
+    private static String safeChatId(IncomingMessage msg) {
+        if (msg.getChat() != null && msg.getChat().getId() != null) {
+            return msg.getChat().getId();
+        }
+        return null;
+    }
+
+    private static String safeUserId(IncomingMessage msg) {
+        if (msg.getFrom() != null && msg.getFrom().getId() != null) {
+            return msg.getFrom().getId();
+        }
+        return null;
+    }
+
+    private static boolean equalsCommand(String text, String cmd) {
+        return text.equalsIgnoreCase(cmd);
+    }
+
+    private static boolean startsWithCommand(String text, String cmd) {
+        if (text.length() < cmd.length()) {
             return false;
         }
-        return true;
+        if (!text.regionMatches(true, 0, cmd, 0, cmd.length())) {
+            return false;
+        }
+        if (text.length() == cmd.length()) {
+            return true;
+        }
+        char c = text.charAt(cmd.length());
+        return Character.isWhitespace(c);
     }
 
-    private String getEffectiveTodoistToken(String userId) {
-        if (userId != null) {
-            Object t = userTokens.get(userId);
-            if (t != null) {
-                String s = String.valueOf(t);
-                if (s != null && s.trim().length() > 0) return s.trim();
+    private static boolean isHelp(String text) {
+        return equalsCommand(text, "/help") || equalsCommand(text, "/start") || equalsCommand(text, "/?");
+    }
+
+    private static String extractArgs(String text, String cmd) {
+        if (text.length() == cmd.length()) {
+            return "";
+        }
+        String rest = text.substring(cmd.length()).trim();
+        return rest;
+    }
+
+    private static class AddCommand {
+        String content;
+        String projectId;
+        String due;
+        Integer priority;
+    }
+
+    private static AddCommand parseAddCommand(String args) {
+        AddCommand cmd = new AddCommand();
+        String[] parts = splitByPipe(args);
+        if (parts.length == 0) {
+            return null;
+        }
+        cmd.content = parts[0].trim();
+        for (int i = 1; i < parts.length; i++) {
+            String p = parts[i].trim();
+            if (p.length() == 0) {
+                continue;
+            }
+            int eq = p.indexOf('=');
+            if (eq <= 0) {
+                continue;
+            }
+            String key = p.substring(0, eq).trim();
+            String val = p.substring(eq + 1).trim();
+            if (key.equalsIgnoreCase("projectId") || key.equalsIgnoreCase("project_id")) {
+                cmd.projectId = val;
+            } else if (key.equalsIgnoreCase("due") || key.equalsIgnoreCase("due_string")) {
+                cmd.due = val;
+            } else if (key.equalsIgnoreCase("priority")) {
+                try {
+                    cmd.priority = Integer.valueOf(Integer.parseInt(val));
+                } catch (Exception e) {
+                    cmd.priority = null;
+                }
             }
         }
-        return todoistToken;
+        return cmd;
     }
 
-    private String helpText() {
-        StringBuffer sb = new StringBuffer();
-        sb.append("Your Personal Task Manager!\n\n");
-        sb.append("Commands:\n");
-        sb.append("/help - Show this help\n");
-        sb.append("/tasks - List active tasks\n");
-        sb.append("/add <content> - Create a task\n");
-        sb.append("/done <task_id> - Mark task completed\n");
-        sb.append("/close <task_id> - Same as /done\n");
-        sb.append("/token <personal_token> - Set Todoist token for your user\n\n");
-        sb.append("Tip: If you have many tasks, use /tasks then copy the ID to /done.");
-        return sb.toString();
+    private static String[] splitByPipe(String s) {
+        java.util.ArrayList list = new java.util.ArrayList();
+        int start = 0;
+        for (int i = 0; i < s.length(); i++) {
+            if (s.charAt(i) == '|') {
+                list.add(s.substring(start, i));
+                start = i + 1;
+            }
+        }
+        list.add(s.substring(start));
+        String[] out = new String[list.size()];
+        for (int i = 0; i < list.size(); i++) {
+            out[i] = (String) list.get(i);
+        }
+        return out;
     }
 
-    private JSONArray todoistGetActiveTasks(String token) throws Exception {
-        String url = TODOIST_REST_V2_BASE + "/tasks";
-        HttpResponse resp = httpRequest("GET", url, token, null, null);
-        if (resp.code != 200) {
-            throw new RuntimeException("Todoist GET /tasks failed (" + resp.code + "): " + trimBody(resp.body));
+    private JSONArray todoistGetTasks() throws Exception {
+        String url = TODOIST_API_BASE + TODOIST_TASKS_PATH;
+        HttpResult res = httpRequest("GET", url, null);
+        if (res.status < 200 || res.status >= 300) {
+            throw new IOException("Todoist GET tasks failed (" + res.status + "): " + truncate(res.body, 400));
         }
         JSONParser parser = new JSONParser(JSONParser.MODE_PERMISSIVE);
-        Object parsed = parser.parse(resp.body);
+        Object parsed = parser.parse(res.body);
         if (parsed instanceof JSONArray) {
             return (JSONArray) parsed;
         }
-        JSONArray arr = new JSONArray();
-        return arr;
+        return new JSONArray();
     }
 
-    private JSONObject todoistCreateTask(String token, String content) throws Exception {
-        String url = TODOIST_REST_V2_BASE + "/tasks";
-        JSONObject body = new JSONObject();
-        body.put("content", content);
-        HttpResponse resp = httpRequest("POST", url, token, "application/json", body.toJSONString());
-        if (resp.code != 200) {
-            throw new RuntimeException("Todoist POST /tasks failed (" + resp.code + "): " + trimBody(resp.body));
+    private JSONObject todoistAddTask(AddCommand add) throws Exception {
+        String url = TODOIST_API_BASE + TODOIST_TASKS_PATH;
+        JSONObject payload = new JSONObject();
+        payload.put("content", add.content);
+        if (add.projectId != null && add.projectId.length() > 0) {
+            payload.put("project_id", add.projectId);
+        }
+        if (add.priority != null) {
+            int p = add.priority.intValue();
+            if (p >= 1 && p <= 4) {
+                payload.put("priority", Integer.valueOf(p));
+            }
+        }
+        if (add.due != null && add.due.length() > 0) {
+            JSONObject due = new JSONObject();
+            due.put("string", add.due);
+            payload.put("due", due);
+        }
+
+        HttpResult res = httpRequest("POST", url, payload.toJSONString());
+        if (res.status < 200 || res.status >= 300) {
+            throw new IOException("Todoist add task failed (" + res.status + "): " + truncate(res.body, 400));
         }
         JSONParser parser = new JSONParser(JSONParser.MODE_PERMISSIVE);
-        Object parsed = parser.parse(resp.body);
+        Object parsed = parser.parse(res.body);
         if (parsed instanceof JSONObject) {
             return (JSONObject) parsed;
         }
-        return new JSONObject();
+        JSONObject o = new JSONObject();
+        o.put("raw", res.body);
+        return o;
     }
 
-    private void todoistCloseTask(String token, String taskId) throws Exception {
-        String url = TODOIST_REST_V2_BASE + "/tasks/" + urlPathEncode(taskId) + "/close";
-        HttpResponse resp = httpRequest("POST", url, token, "application/json", "{}");
-        if (resp.code != 204 && resp.code != 200) {
-            throw new RuntimeException("Todoist POST /tasks/{id}/close failed (" + resp.code + "): " + trimBody(resp.body));
+    private void todoistCloseTask(String taskId) throws Exception {
+        String url = TODOIST_API_BASE + TODOIST_TASKS_PATH + "/" + urlEncode(taskId) + "/close";
+        HttpResult res = httpRequest("POST", url, "");
+        if (res.status < 200 || res.status >= 300) {
+            throw new IOException("Todoist close task failed (" + res.status + "): " + truncate(res.body, 400));
+        }
+    }
+
+    private void todoistDeleteTask(String taskId) throws Exception {
+        String url = TODOIST_API_BASE + TODOIST_TASKS_PATH + "/" + urlEncode(taskId);
+        HttpResult res = httpRequest("DELETE", url, null);
+        if (res.status != 204 && (res.status < 200 || res.status >= 300)) {
+            throw new IOException("Todoist delete task failed (" + res.status + "): " + truncate(res.body, 400));
         }
     }
 
     private String formatTasks(JSONArray tasks) {
         if (tasks == null || tasks.size() == 0) {
-            return "No active tasks.";
+            return "No open tasks.";
         }
         StringBuffer sb = new StringBuffer();
-        sb.append("Active tasks (").append(tasks.size()).append("):\n\n");
+        sb.append("Open tasks (").append(tasks.size()).append("):\n");
         for (int i = 0; i < tasks.size(); i++) {
             Object o = tasks.get(i);
-            if (!(o instanceof JSONObject)) continue;
+            if (!(o instanceof JSONObject)) {
+                continue;
+            }
             JSONObject t = (JSONObject) o;
-            String id = t.getAsString("id");
-            String content = t.getAsString("content");
-            String dueStr = null;
+            String id = asString(t.get("id"));
+            String content = asString(t.get("content"));
+            String priority = asString(t.get("priority"));
+            String dueStr = "";
             Object dueObj = t.get("due");
             if (dueObj instanceof JSONObject) {
-                JSONObject due = (JSONObject) dueObj;
-                String date = due.getAsString("date");
-                String datetime = due.getAsString("datetime");
-                if (datetime != null && datetime.length() > 0) dueStr = datetime;
-                else if (date != null && date.length() > 0) dueStr = date;
+                String ds = asString(((JSONObject) dueObj).get("string"));
+                String dt = asString(((JSONObject) dueObj).get("datetime"));
+                String d = ds.length() > 0 ? ds : dt;
+                if (d.length() > 0) {
+                    dueStr = " | due: " + d;
+                }
             }
-            if (content == null) content = "";
-            if (id == null) id = "";
-            sb.append("- ").append(content);
-            if (dueStr != null && dueStr.length() > 0) {
-                sb.append(" (due: ").append(dueStr).append(")");
+            String pr = "";
+            if (priority.length() > 0) {
+                pr = " | p" + priority;
             }
-            sb.append("\n  id: ").append(id).append("\n\n");
+            sb.append("- [").append(id).append("] ").append(content).append(pr).append(dueStr).append("\n");
         }
-        sb.append("Use /done <id> to complete a task.");
+        sb.append("\nTip: /done <id> or /delete <id>");
         return sb.toString();
     }
 
-    private static class HttpResponse {
-        int code;
-        String body;
-        HttpResponse(int code, String body) {
-            this.code = code;
-            this.body = body;
+    private String formatCreatedTask(JSONObject task) {
+        if (task == null) {
+            return "Task created.";
         }
+        String id = asString(task.get("id"));
+        String content = asString(task.get("content"));
+        String url = asString(task.get("url"));
+        StringBuffer sb = new StringBuffer();
+        sb.append("Created task");
+        if (id.length() > 0) {
+            sb.append(" [").append(id).append("]");
+        }
+        if (content.length() > 0) {
+            sb.append(": ").append(content);
+        }
+        if (url.length() > 0) {
+            sb.append("\n").append(url);
+        }
+        return sb.toString();
     }
 
-    private HttpResponse httpRequest(String method, String urlStr, String bearerToken, String contentType, String body) throws Exception {
-        URL url = new URL(urlStr);
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setRequestMethod(method);
-        conn.setConnectTimeout(HTTP_TIMEOUT_MS);
-        conn.setReadTimeout(HTTP_TIMEOUT_MS);
-        conn.setUseCaches(false);
-        conn.setDoInput(true);
+    private static String asString(Object o) {
+        return o == null ? "" : String.valueOf(o);
+    }
 
-        conn.setRequestProperty("Authorization", "Bearer " + bearerToken);
-        conn.setRequestProperty("Accept", "application/json");
-
-        if (contentType != null) {
-            conn.setRequestProperty("Content-Type", contentType);
+    private static String truncate(String s, int max) {
+        if (s == null) {
+            return "";
         }
-
-        if (body != null && ("POST".equalsIgnoreCase(method) || "PUT".equalsIgnoreCase(method) || "PATCH".equalsIgnoreCase(method))) {
-            conn.setDoOutput(true);
-            byte[] bytes = body.getBytes("UTF-8");
-            conn.setRequestProperty("Content-Length", String.valueOf(bytes.length));
-            OutputStream os = null;
-            try {
-                os = conn.getOutputStream();
-                os.write(bytes);
-                os.flush();
-            } finally {
-                if (os != null) {
-                    try { os.close(); } catch (Exception e) { }
-                }
-            }
+        if (s.length() <= max) {
+            return s;
         }
+        return s.substring(0, max) + "...";
+    }
 
-        int code = conn.getResponseCode();
+    private static class HttpResult {
+        int status;
+        String body;
+        Map headers;
+    }
+
+    private HttpResult httpRequest(String method, String urlStr, String jsonBody) throws Exception {
+        HttpURLConnection conn = null;
         InputStream is = null;
         try {
-            if (code >= 200 && code < 400) {
+            URL url = new URL(urlStr);
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod(method);
+            conn.setConnectTimeout(HTTP_TIMEOUT_MS);
+            conn.setReadTimeout(HTTP_TIMEOUT_MS);
+            conn.setUseCaches(false);
+
+            conn.setRequestProperty("Authorization", "Bearer " + getTodoistToken());
+            conn.setRequestProperty("Accept", "application/json");
+
+            if (jsonBody != null && (method.equals("POST") || method.equals("PUT"))) {
+                conn.setDoOutput(true);
+                conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+                byte[] bytes = jsonBody.getBytes("UTF-8");
+                conn.setRequestProperty("Content-Length", String.valueOf(bytes.length));
+                OutputStream os = conn.getOutputStream();
+                os.write(bytes);
+                os.flush();
+                os.close();
+            }
+
+            int status = conn.getResponseCode();
+            if (status >= 200 && status < 400) {
                 is = conn.getInputStream();
             } else {
                 is = conn.getErrorStream();
+                if (is == null) {
+                    is = conn.getInputStream();
+                }
             }
-            String respBody = readAll(is);
-            return new HttpResponse(code, respBody);
+
+            String body = readAll(is);
+            HttpResult r = new HttpResult();
+            r.status = status;
+            r.body = body;
+            r.headers = new HashMap();
+            return r;
         } finally {
             if (is != null) {
                 try { is.close(); } catch (Exception e) { }
             }
-            try { conn.disconnect(); } catch (Exception e) { }
+            if (conn != null) {
+                try { conn.disconnect(); } catch (Exception e) { }
+            }
         }
     }
 
-    private String readAll(InputStream is) throws IOException {
-        if (is == null) return "";
+    private static String readAll(InputStream is) throws Exception {
+        if (is == null) {
+            return "";
+        }
         BufferedReader br = new BufferedReader(new InputStreamReader(is, "UTF-8"));
         StringBuffer sb = new StringBuffer();
         String line;
@@ -489,89 +600,43 @@ public class ExtensionCustomLogic extends CallbackAdapter {
         return sb.toString().trim();
     }
 
-    private String loadTodoistTokenFromConfig() {
-        FileInputStream fis = null;
-        try {
-            String path = System.getProperty("bot.config");
-            if (path == null || path.trim().length() == 0) {
-                path = System.getenv("BOT_CONFIG");
-            }
-            if (path == null || path.trim().length() == 0) {
-                path = "bot_config.json";
-            }
-            fis = new FileInputStream(path);
-            String json = readAll(fis);
-            if (json == null || json.trim().length() == 0) return null;
-
-            JSONParser parser = new JSONParser(JSONParser.MODE_PERMISSIVE);
-            Object parsed = parser.parse(json);
-            if (!(parsed instanceof JSONObject)) return null;
-            JSONObject root = (JSONObject) parsed;
-
-            Object integ = root.get("integration");
-            if (integ instanceof JSONObject) {
-                JSONObject integration = (JSONObject) integ;
-                String token = integration.getAsString("token");
-                if (token != null && token.trim().length() > 0) return token.trim();
-            }
-
-            String token2 = root.getAsString("todoist_token");
-            if (token2 != null && token2.trim().length() > 0) return token2.trim();
-
-            String token3 = root.getAsString("bot_token");
-            if (token3 != null && token3.trim().length() > 0) {
-                return null;
-            }
-
-            return null;
-        } catch (Exception e) {
-            return null;
-        } finally {
-            if (fis != null) {
-                try { fis.close(); } catch (Exception e) { }
-            }
+    private static String urlEncode(String s) throws Exception {
+        if (s == null) {
+            return "";
         }
+        return java.net.URLEncoder.encode(s, "UTF-8");
     }
 
-    private boolean looksLikeChatMessagePayload(JSONObject obj) {
-        if (obj == null) return false;
-        if (obj.containsKey("message")) return true;
-        if (obj.containsKey("chat") && obj.containsKey("text")) return true;
-        if (obj.containsKey("from") && obj.containsKey("chat")) return true;
+    private static boolean looksLikeChatMessage(JSONObject obj) {
+        try {
+            if (obj.containsKey("message")) {
+                Object m = obj.get("message");
+                if (m instanceof JSONObject) {
+                    return true;
+                }
+            }
+            if (obj.containsKey("text") && obj.containsKey("chat")) {
+                return true;
+            }
+        } catch (Exception e) {
+            return false;
+        }
         return false;
     }
 
-    private String[] splitFirstArg(String text) {
-        String[] out = new String[2];
-        out[0] = text;
-        out[1] = null;
-        if (text == null) return out;
-        String t = text.trim();
-        int sp = t.indexOf(' ');
-        if (sp < 0) {
-            return out;
+    private static String getTodoistToken() throws Exception {
+        String env = System.getenv("TODOIST_TOKEN");
+        if (env != null && env.trim().length() > 0) {
+            return env.trim();
         }
-        out[0] = t.substring(0, sp).trim();
-        out[1] = t.substring(sp + 1).trim();
-        return out;
-    }
-
-    private String urlPathEncode(String s) throws Exception {
-        if (s == null) return "";
-        return URLEncoder.encode(s, "UTF-8").replace("+", "%20");
-    }
-
-    private String trimBody(String body) {
-        if (body == null) return "";
-        String b = body.trim();
-        if (b.length() > 500) {
-            return b.substring(0, 500) + "...";
+        String prop = System.getProperty("todoist.token");
+        if (prop != null && prop.trim().length() > 0) {
+            return prop.trim();
         }
-        return b;
-    }
-
-    private String safe(String s) {
-        if (s == null) return "";
-        return s;
+        String embedded = "77f063eb6f75fea4d48bff454ece5387997c611c77f063eb6f75fea4d48bff454ece5387997c611c";
+        if (embedded != null && embedded.trim().length() > 0) {
+            return embedded.trim();
+        }
+        throw new IOException("Missing Todoist token. Set TODOIST_TOKEN env var or -Dtodoist.token");
     }
 }
